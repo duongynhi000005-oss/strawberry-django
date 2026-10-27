@@ -6,25 +6,119 @@ class methods for federation entity types backed by Django models.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_origin
 
 from django.db import models
+from strawberry.annotation import StrawberryAnnotation
+from strawberry.scalars import ID
+from strawberry.schema.types.scalar import DEFAULT_SCALAR_REGISTRY
+from strawberry.types import get_object_definition
+from strawberry.types.field import UNRESOLVED
 from strawberry.types.info import Info
+from strawberry.types.scalar import ScalarDefinition, ScalarWrapper
 from strawberry.utils.await_maybe import AwaitableOrValue
 
 from strawberry_django.queryset import run_type_get_queryset
 from strawberry_django.resolvers import django_resolver
+from strawberry_django.utils.typing import unwrap_type
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from strawberry_django.utils.typing import WithStrawberryDjangoObjectDefinition
 
 _M = TypeVar("_M", bound=models.Model)
+
+_PRIMITIVE_DEFAULT_SCALARS = (str, int, float, bool, ID)
 
 
 __all__ = [
     "generate_resolve_reference",
     "resolve_model_reference",
 ]
+
+
+def _get_key_field_type(
+    cls: type[WithStrawberryDjangoObjectDefinition],
+    key: str,
+    info: Info | None = None,
+) -> Any:
+    type_def = get_object_definition(cls)
+    if type_def is not None:
+        name_converter = info.schema.config.name_converter if info is not None else None
+        for field in type_def.fields:
+            if key in {field.python_name, field.name, field.graphql_name} or (
+                name_converter is not None and name_converter.from_field(field) == key
+            ):
+                resolved = field.resolve_type(type_definition=type_def)
+                if resolved is not UNRESOLVED:
+                    return unwrap_type(resolved)
+
+    annotations = getattr(cls, "__annotations__", {})
+    if key in annotations:
+        return unwrap_type(StrawberryAnnotation(annotations[key]).resolve())
+
+    return None
+
+
+def _get_scalar_definition(
+    field_type: Any,
+    scalar_registry: Mapping[object, ScalarWrapper | ScalarDefinition],
+) -> ScalarDefinition | None:
+    if isinstance(field_type, ScalarDefinition):
+        return field_type
+
+    if isinstance(field_type, ScalarWrapper) or hasattr(
+        field_type, "_scalar_definition"
+    ):
+        return field_type._scalar_definition
+
+    target = field_type
+    if target not in scalar_registry:
+        origin = get_origin(target)
+        if origin is not None and origin in scalar_registry:
+            target = origin
+
+    if target in scalar_registry:
+        registered = scalar_registry[target]
+        if isinstance(registered, ScalarWrapper):
+            return registered._scalar_definition
+        return registered
+
+    return None
+
+
+def _parse_key_value(
+    cls: type[WithStrawberryDjangoObjectDefinition],
+    key: str,
+    value: Any,
+    info: Info | None = None,
+) -> Any:
+    if value is None:
+        return None
+
+    field_type = _get_key_field_type(cls, key, info=info)
+    if field_type is None:
+        return value
+
+    scalar_registry: Mapping[object, ScalarWrapper | ScalarDefinition] = (
+        info.schema.schema_converter.scalar_registry
+        if info is not None
+        else DEFAULT_SCALAR_REGISTRY
+    )
+
+    scalar_def = _get_scalar_definition(field_type, scalar_registry)
+    if scalar_def is None or scalar_def.parse_value is None:
+        return value
+
+    is_default_scalar = scalar_def is DEFAULT_SCALAR_REGISTRY.get(field_type)
+    if is_default_scalar:
+        if field_type in _PRIMITIVE_DEFAULT_SCALARS:
+            return value
+        if isinstance(field_type, type) and isinstance(value, field_type):
+            return value
+
+    return scalar_def.parse_value(value)
 
 
 def resolve_model_reference(
@@ -73,7 +167,11 @@ def generate_resolve_reference(key_fields: list[str]) -> classmethod:
     ) -> AwaitableOrValue[Any]:
         # Extract only the key fields from kwargs
         # (federation may pass additional fields)
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in key_fields}
+        filtered_kwargs = {
+            k: _parse_key_value(cls, k, v, info=info)
+            for k, v in kwargs.items()
+            if k in key_fields
+        }
         if not filtered_kwargs:
             msg = (
                 f"No matching key fields found in kwargs. "

@@ -426,3 +426,113 @@ def test_resolve_reference_composite_key_via_entities():
     assert result.data is not None
     assert result.data["_entities"][0]["id"] == str(fruit.id)
     assert result.data["_entities"][0]["sweetness"] == 8
+
+
+# =============================================================================
+# Scalar mapping in resolve_reference
+# =============================================================================
+
+
+@pytest.mark.django_db
+def test_resolve_reference_with_scalar_wrapper():
+    """Test resolve_reference applies custom ScalarWrapper parse_value."""
+    from typing import NewType
+
+    prefixed_id = strawberry.scalar(
+        NewType("PrefixedID", int),
+        serialize=lambda v: f"fruit:{v}",
+        parse_value=lambda v: int(str(v).removeprefix("fruit:")),
+    )
+
+    @strawberry_django.federation.type(models.Fruit, keys=["id"])
+    class FruitType:
+        id: prefixed_id
+        name: strawberry.auto
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def hello(self) -> str:
+            return "world"
+
+    schema = FederationSchema(query=Query, types=[FruitType])
+    fruit = models.Fruit.objects.create(name="dragonfruit")
+
+    # Direct call without info
+    direct = call_resolve_reference(FruitType, id=f"fruit:{fruit.id}")
+    assert direct.id == fruit.id
+    assert direct.name == "dragonfruit"
+
+    # End-to-end via _entities
+    result = schema.execute_sync(
+        f"""
+        query {{
+            _entities(representations: [
+                {{__typename: "FruitType", id: "fruit:{fruit.id}"}}
+            ]) {{
+                ... on FruitType {{
+                    id
+                    name
+                }}
+            }}
+        }}
+        """
+    )
+
+    assert result.errors is None
+    assert result.data is not None
+    assert result.data["_entities"][0]["id"] == f"fruit:{fruit.id}"
+    assert result.data["_entities"][0]["name"] == "dragonfruit"
+
+
+@pytest.mark.django_db
+def test_resolve_reference_with_scalar_map():
+    """Test resolve_reference applies StrawberryConfig.scalar_map parse_value."""
+    from typing import NewType
+
+    from strawberry.schema.config import StrawberryConfig
+
+    EncodedID = NewType("EncodedID", int)
+    encoded_id_scalar = strawberry.scalar(
+        name="EncodedID",
+        serialize=lambda v: f"enc:{v}",
+        parse_value=lambda v: int(str(v).removeprefix("enc:")),
+    )
+
+    @strawberry_django.federation.type(models.Fruit, keys=["id"])
+    class FruitType:
+        id: EncodedID
+        name: strawberry.auto
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def hello(self) -> str:
+            return "world"
+
+    schema = FederationSchema(
+        query=Query,
+        types=[FruitType],
+        config=StrawberryConfig(scalar_map={EncodedID: encoded_id_scalar}),
+    )
+    fruit = models.Fruit.objects.create(name="lychee")
+
+    result = schema.execute_sync(
+        f"""
+        query {{
+            _entities(representations: [
+                {{__typename: "FruitType", id: "enc:{fruit.id}"}}
+            ]) {{
+                ... on FruitType {{
+                    id
+                    name
+                }}
+            }}
+        }}
+        """
+    )
+
+    assert result.errors is None
+    assert result.data is not None
+    assert result.data["_entities"][0]["id"] == f"enc:{fruit.id}"
+    assert result.data["_entities"][0]["name"] == "lychee"
